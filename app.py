@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Garena Bind Tool - Premium Web Edition v3 (All Features)"""
+"""Garena Bind Tool - Premium Web Edition v4 (Full + Fixed)"""
 
-import os, sys, json, io, csv, re, hashlib, base64, secrets, socket
-import urllib.parse, sqlite3
+import os, sys, json, io, csv, re, hashlib, base64, secrets, socket, threading
+import urllib.parse, sqlite3, traceback
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -11,6 +11,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from flask import (Flask, request, session, redirect, url_for,
                    render_template_string, flash, make_response)
+from werkzeug.exceptions import HTTPException
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
@@ -28,7 +29,7 @@ except ImportError:
     QR_AVAILABLE = False
 
 # ================== CONFIG ==================
-SECRET_KEY     = os.environ.get('SECRET_KEY', 'garena_bindtool_premium_secret_v3')
+SECRET_KEY     = os.environ.get('SECRET_KEY', 'garena_bindtool_premium_secret_v4')
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', '1')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '1')
 DATABASE       = os.environ.get('DATABASE_PATH', 'bindtool.db')
@@ -38,38 +39,110 @@ app.secret_key = SECRET_KEY
 app.permanent_session_lifetime = timedelta(days=3650)
 
 # ================== DB ==================
+_init_lock = threading.Lock()
+_init_done = False
+
 def db():
-    c = sqlite3.connect(DATABASE); c.row_factory = sqlite3.Row; return c
+    c = sqlite3.connect(DATABASE, timeout=15, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
 
 def hash_pw(p): return hashlib.sha256(p.encode()).hexdigest()
 
+def _ensure_column(conn, table, col, defn):
+    try:
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
+            conn.commit()
+    except Exception as e:
+        print(f"[init] column {col} error: {e}", flush=True)
+
 def init_db():
-    c = sqlite3.connect(DATABASE).cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0, created_at TEXT, last_login TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS token_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, feature TEXT, access_token TEXT, details TEXT, status TEXT, timestamp TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS token_vault (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, name TEXT, token TEXT, notes TEXT, created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS saved_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, account_name TEXT, uid TEXT, token TEXT, region TEXT, created_at TEXT)''')
-    for col, defn in [('banned','INTEGER DEFAULT 0'),('ban_reason','TEXT'),('active_session_token','TEXT')]:
-        try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {defn}")
-        except: pass
-    c.connection.commit(); c.connection.close()
-    # ensure admin exists
-    conn = db()
-    row = conn.execute("SELECT id FROM users WHERE username=?", (ADMIN_USERNAME,)).fetchone()
-    if not row:
-        conn.execute("INSERT INTO users (username,password_hash,is_admin,created_at) VALUES (?,?,1,?)",
-                     (ADMIN_USERNAME, hash_pw(ADMIN_PASSWORD), datetime.now().isoformat()))
-    else:
-        conn.execute("UPDATE users SET is_admin=1 WHERE username=?", (ADMIN_USERNAME,))
-    conn.commit(); conn.close()
+    global _init_done
+    with _init_lock:
+        if _init_done: return
+        try:
+            conn = db()
+            conn.execute('''CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER DEFAULT 0,
+                created_at TEXT,
+                last_login TEXT,
+                banned INTEGER DEFAULT 0,
+                ban_reason TEXT,
+                active_session_token TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS token_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT, feature TEXT, access_token TEXT,
+                details TEXT, status TEXT, timestamp TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS token_vault (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT, name TEXT, token TEXT, notes TEXT, created_at TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS saved_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT, account_name TEXT, uid TEXT,
+                token TEXT, region TEXT, created_at TEXT
+            )''')
+            conn.commit()
+
+            for col, defn in [('banned','INTEGER DEFAULT 0'),
+                              ('ban_reason','TEXT'),
+                              ('active_session_token','TEXT')]:
+                _ensure_column(conn, 'users', col, defn)
+
+            conn.execute(
+                "INSERT OR IGNORE INTO users (username,password_hash,is_admin,created_at) VALUES (?,?,1,?)",
+                (ADMIN_USERNAME, hash_pw(ADMIN_PASSWORD), datetime.now().isoformat()))
+            conn.execute("UPDATE users SET is_admin=1 WHERE username=?", (ADMIN_USERNAME,))
+            conn.commit()
+            conn.close()
+            _init_done = True
+            print(f"[init] DB ready, admin='{ADMIN_USERNAME}'", flush=True)
+        except Exception as e:
+            print(f"[init] FATAL: {e}", flush=True)
+            traceback.print_exc()
+
+init_db()
 
 def log_token(username, feature, access_token, details="", status="used"):
     try:
         conn = db()
         conn.execute("INSERT INTO token_logs (username,feature,access_token,details,status,timestamp) VALUES (?,?,?,?,?,?)",
-                     (username, feature, access_token[:200], details, status, datetime.now().isoformat(timespec='seconds')))
+                     (username, feature, str(access_token)[:200], details, status,
+                      datetime.now().isoformat(timespec='seconds')))
         conn.commit(); conn.close()
-    except: pass
+    except Exception as e:
+        print(f"[log_token] {e}", flush=True)
+
+# ================== ERROR HANDLERS ==================
+@app.errorhandler(500)
+def handle_500(e):
+    tb = traceback.format_exc()
+    print(f"[500 ERROR]\n{tb}", flush=True)
+    return render_template_string('''<!DOCTYPE html>
+<html><head><title>Error</title>
+<style>body{font-family:sans-serif;background:#06080f;color:#e5e7eb;padding:40px;max-width:800px;margin:auto}
+h1{color:#ef4444}pre{background:#151a2e;padding:20px;border-radius:8px;overflow-x:auto;font-size:.85em;border:1px solid #2a3050;white-space:pre-wrap;word-break:break-all}
+a{color:#a78bfa;display:inline-block;margin-top:20px}</style></head><body>
+<h1>Internal Server Error</h1>
+<p>Something broke. Here's the traceback (admin: check Render logs):</p>
+<pre>{{ tb }}</pre>
+<a href="/login">Back to Login</a></body></html>''', tb=tb), 500
+
+@app.errorhandler(Exception)
+def handle_exc(e):
+    if isinstance(e, (SystemExit, KeyboardInterrupt)): raise e
+    if isinstance(e, HTTPException) and e.code < 500:
+        return e
+    tb = traceback.format_exc()
+    print(f"[EXC] {type(e).__name__}: {e}\n{tb}", flush=True)
+    return handle_500(e)
 
 # ================== MIDDLEWARE ==================
 @app.before_request
@@ -78,13 +151,21 @@ def enforce_admin_single():
     if session.get('is_admin'):
         try:
             conn = db()
-            row = conn.execute("SELECT active_session_token FROM users WHERE username=?", (session['username'],)).fetchone()
+            row = conn.execute("SELECT active_session_token FROM users WHERE username=?",
+                               (session['username'],)).fetchone()
             conn.close()
-            if row and row['active_session_token'] and row['active_session_token'] != session.get('session_token'):
-                session.clear()
-                flash('Session terminated: You logged in from another device.', 'error')
-                return redirect(url_for('login'))
-        except: pass
+            if row:
+                try:
+                    stored = row['active_session_token']
+                except (IndexError, KeyError):
+                    stored = None
+                cur = session.get('session_token')
+                if stored and cur and stored != cur:
+                    session.clear()
+                    flash('Session terminated: You logged in from another device.', 'error')
+                    return redirect(url_for('login'))
+        except Exception as e:
+            print(f"[admin_single] {e}", flush=True)
 
 @app.before_request
 def enforce_ban():
@@ -92,13 +173,21 @@ def enforce_ban():
     if session.get('username') and not session.get('is_admin'):
         try:
             conn = db()
-            row = conn.execute("SELECT banned, ban_reason FROM users WHERE username=?", (session['username'],)).fetchone()
+            row = conn.execute("SELECT banned, ban_reason FROM users WHERE username=?",
+                               (session['username'],)).fetchone()
             conn.close()
-            if row and row['banned']:
-                session.clear()
-                flash('Your account has been banned.' + (f" Reason: {row['ban_reason']}" if row['ban_reason'] else ''), 'error')
-                return redirect(url_for('login'))
-        except: pass
+            if row:
+                try:
+                    banned = row['banned'] or 0
+                    reason = row['ban_reason']
+                except (IndexError, KeyError):
+                    banned, reason = 0, None
+                if banned:
+                    session.clear()
+                    flash('Your account has been banned.' + (f" Reason: {reason}" if reason else ''), 'error')
+                    return redirect(url_for('login'))
+        except Exception as e:
+            print(f"[enforce_ban] {e}", flush=True)
 
 @app.before_request
 def auto_restore_user():
@@ -106,12 +195,14 @@ def auto_restore_user():
     if 'username' in session and not session.get('is_admin') and 'password_hash' in session:
         try:
             conn = db()
-            if not conn.execute("SELECT id FROM users WHERE username=?", (session['username'],)).fetchone():
-                conn.execute("INSERT INTO users (username,password_hash,is_admin,created_at) VALUES (?,?,0,?)",
+            row = conn.execute("SELECT id FROM users WHERE username=?", (session['username'],)).fetchone()
+            if not row:
+                conn.execute("INSERT OR IGNORE INTO users (username,password_hash,is_admin,created_at) VALUES (?,?,0,?)",
                              (session['username'], session['password_hash'], datetime.now().isoformat()))
                 conn.commit()
             conn.close()
-        except: pass
+        except Exception as e:
+            print(f"[auto_restore] {e}", flush=True)
 
 def login_required(f):
     @wraps(f)
@@ -155,7 +246,6 @@ ICONS = {
  'download':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>',
  'trash':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>',
  'plus':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>',
- 'edit':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>',
  'ban':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m4.93 4.93 14.14 14.14"/></svg>',
  'chart':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18M7 12h2v7H7zM12 5h2v14h-2zM17 9h2v10h-2z"/></svg>',
  'filter':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/></svg>',
@@ -243,10 +333,9 @@ label.lbl{display:block;color:var(--muted);font-size:.78em;margin-bottom:6px;fon
 .flash-error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#fca5a5}
 .flash-info{background:rgba(6,182,212,.1);border:1px solid rgba(6,182,212,.3);color:#67e8f9}
 .loading-box{display:none;background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.3);border-radius:12px;padding:22px;margin-top:14px;text-align:center}
-.loading-box.active{display:block;animation:fadeIn .3s}
+.loading-box.active{display:block}
 .spinner{width:32px;height:32px;border:3px solid rgba(139,92,246,.2);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 10px}
 @keyframes spin{to{transform:rotate(360deg)}}
-@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .loading-text{color:var(--primary2);font-size:.9em;font-weight:500}
 .step-header{display:flex;align-items:center;gap:10px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)}
 .step-num{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,var(--primary),#7c3aed);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.85em;flex-shrink:0}
@@ -271,7 +360,7 @@ tr:hover td{background:rgba(139,92,246,.03)}
 .hidden{display:none!important}
 .bar-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:.85em}
 .bar-label{min-width:100px;color:var(--muted);flex-shrink:0}
-.bar-track{flex:1;background:rgba(0,0,0,.3);border-radius:6px;height:22px;overflow:hidden;position:relative}
+.bar-track{flex:1;background:rgba(0,0,0,.3);border-radius:6px;height:22px;overflow:hidden}
 .bar-fill{background:linear-gradient(90deg,var(--primary),var(--accent));height:100%;border-radius:6px;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#fff;font-size:.75em;font-weight:600;min-width:24px}
 .qr-svg{background:#fff;padding:16px;border-radius:12px;display:inline-block;max-width:100%}
 .qr-svg svg{width:220px;height:220px;color:#000}
@@ -299,12 +388,16 @@ document.addEventListener('DOMContentLoaded',bindAjax);
 </script></body></html>'''
 
 def render_page(title, content_tpl, **kw):
-    kw['ICONS'] = ICONS
-    content = render_template_string(content_tpl, **kw)
-    return render_template_string(BASE_HTML, title=title, content=content,
-                                   username=session.get('username'),
-                                   is_admin=session.get('is_admin', False),
-                                   ICONS=ICONS)
+    try:
+        kw['ICONS'] = ICONS
+        content = render_template_string(content_tpl, **kw)
+        return render_template_string(BASE_HTML, title=title, content=content,
+                                       username=session.get('username'),
+                                       is_admin=session.get('is_admin', False),
+                                       ICONS=ICONS)
+    except Exception as e:
+        print(f"[render_page] {title} err: {e}\n{traceback.format_exc()}", flush=True)
+        raise
 
 # ================== HELPERS ==================
 def friendly_error(err):
@@ -342,7 +435,9 @@ def fetch_player(token):
         url = f"https://api-otrss.garena.com/support/callback/?access_token={token}"
         r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15, allow_redirects=True)
         q = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query)
-        return {'uid':q.get("account_id",["?"])[0], 'nickname':urllib.parse.unquote(q.get("nickname",["?"])[0]), 'region':q.get("region",["?"])[0]}
+        return {'uid':q.get("account_id",["?"])[0],
+                'nickname':urllib.parse.unquote(q.get("nickname",["?"])[0]),
+                'region':q.get("region",["?"])[0]}
     except Exception as e: return {'error': str(e)}
 
 def fetch_bind_info(token):
@@ -387,26 +482,45 @@ def login():
         if not u or not p:
             flash('Username and password required', 'error')
         else:
-            conn = db()
-            row = conn.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
-            if row and row['password_hash'] == hash_pw(p):
-                if row['banned']:
-                    conn.close()
-                    flash('Account banned' + (f": {row['ban_reason']}" if row['ban_reason'] else ''), 'error')
+            try:
+                conn = db()
+                row = conn.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
+                if row and row['password_hash'] == hash_pw(p):
+                    is_banned = 0
+                    ban_reason = None
+                    try:
+                        is_banned = row['banned'] if 'banned' in row.keys() else 0
+                        ban_reason = row['ban_reason'] if 'ban_reason' in row.keys() else None
+                    except: pass
+                    if is_banned:
+                        conn.close()
+                        flash('Account banned' + (f": {ban_reason}" if ban_reason else ''), 'error')
+                    else:
+                        session.permanent = True
+                        session['username'] = u
+                        session['password_hash'] = row['password_hash']
+                        session['is_admin'] = bool(row['is_admin'])
+                        session['session_token'] = secrets.token_hex(32)
+                        try:
+                            conn.execute("UPDATE users SET last_login=?, active_session_token=? WHERE id=?",
+                                         (datetime.now().isoformat(), session['session_token'], row['id']))
+                            conn.commit()
+                        except Exception as ue:
+                            print(f"[login] update session err: {ue}", flush=True)
+                            try:
+                                conn.execute("UPDATE users SET last_login=? WHERE id=?",
+                                             (datetime.now().isoformat(), row['id']))
+                                conn.commit()
+                            except: pass
+                        conn.close()
+                        log_token(u, 'login', '-', 'login', 'success')
+                        return redirect(url_for('dashboard'))
                 else:
-                    session.permanent = True
-                    session['username'] = u
-                    session['password_hash'] = row['password_hash']
-                    session['is_admin'] = bool(row['is_admin'])
-                    session['session_token'] = secrets.token_hex(32)
-                    conn.execute("UPDATE users SET last_login=?, active_session_token=? WHERE id=?",
-                                 (datetime.now().isoformat(), session['session_token'], row['id']))
-                    conn.commit(); conn.close()
-                    log_token(u, 'login', '-', 'login', 'success')
-                    return redirect(url_for('dashboard'))
-            else:
-                conn.close()
-                flash('Invalid username or password', 'error')
+                    conn.close()
+                    flash('Invalid username or password', 'error')
+            except Exception as e:
+                print(f"[login] err: {e}\n{traceback.format_exc()}", flush=True)
+                flash('Login error. Try again.', 'error')
 
     tpl = '''
     <div class="auth-wrap"><div class="auth-card">
@@ -448,6 +562,9 @@ def register():
                 log_token(u,'register','-','new user','success')
                 return redirect(url_for('dashboard'))
             except sqlite3.IntegrityError: flash('Username already exists','error')
+            except Exception as e:
+                print(f"[register] {e}", flush=True)
+                flash('Registration error','error')
 
     tpl = '''
     <div class="auth-wrap"><div class="auth-card">
@@ -517,7 +634,8 @@ def dashboard():
         cards = ''.join(f'<a class="feature-card" href="/feature/{slug}"><div class="icon-wrap">{ICONS[icon]}</div><h3>{title}</h3><p>{desc}</p></a>' for slug,icon,title,desc in feats)
         sections_html += f'<div class="section-title">{section}</div><div class="feature-grid">{cards}</div>'
     if session.get('is_admin'):
-        sections_html += f'<div class="section-title">{{{{ ICONS.crown|safe }}}} Admin</div><div class="feature-grid"><a class="feature-card" href="/admin" style="border-color:rgba(245,158,11,.3)"><div class="icon-wrap" style="background:linear-gradient(135deg,rgba(245,158,11,.2),rgba(239,68,68,.15))">{ICONS.crown}</div><h3>Admin Panel</h3><p>Manage users and logs</p></a></div>'
+        admin_card = f'<div class="section-title">Admin</div><div class="feature-grid"><a class="feature-card" href="/admin" style="border-color:rgba(245,158,11,.3)"><div class="icon-wrap" style="background:linear-gradient(135deg,rgba(245,158,11,.2),rgba(239,68,68,.15))">{ICONS["crown"]}</div><h3>Admin Panel</h3><p>Manage users and logs</p></a></div>'
+        sections_html += admin_card
     tpl = f'''
     <div class="container">
       <h1 class="page-title">{ICONS['layers']} Dashboard</h1>
@@ -526,7 +644,10 @@ def dashboard():
     </div>'''
     return render_page('Dashboard', tpl)
 
-# ================== CORE FEATURES ==================
+@app.template_filter('human_secs')
+def _hs(s): return convert_secs(s)
+
+# ================== FEATURE: BIND INFO ==================
 @app.route('/feature/bind_info', methods=['GET','POST'])
 @login_required
 def feature_bind_info():
@@ -583,10 +704,7 @@ def feature_bind_info():
     </div>'''
     return render_page('Check Bind Info', tpl, result=result)
 
-@app.template_filter('human_secs')
-def _hs(s): return convert_secs(s)
-
-# ================== BIND EMAIL ==================
+# ================== FEATURE: BIND EMAIL ==================
 @app.route('/feature/bind_email', methods=['GET','POST'])
 @login_required
 def feature_bind_email():
@@ -664,7 +782,7 @@ def feature_bind_email():
     </div>'''
     return render_page('Bind Email', tpl, result=result, error=error, step=step)
 
-# ================== UNBIND EMAIL ==================
+# ================== FEATURE: UNBIND EMAIL ==================
 @app.route('/feature/unbind_email', methods=['GET','POST'])
 @login_required
 def feature_unbind_email():
@@ -746,7 +864,7 @@ def feature_unbind_email():
     </div>'''
     return render_page('Unbind Email', tpl, result=result, error=error, state=state)
 
-# ================== CHANGE BIND ==================
+# ================== FEATURE: CHANGE BIND ==================
 @app.route('/feature/change_bind', methods=['GET','POST'])
 @login_required
 def feature_change_bind():
@@ -862,7 +980,7 @@ def feature_change_bind():
     </div>'''
     return render_page('Change Bind Email', tpl, result=result, error=error, state=state)
 
-# ================== CANCEL BIND ==================
+# ================== FEATURE: CANCEL BIND ==================
 @app.route('/feature/cancel_bind', methods=['GET','POST'])
 @login_required
 def feature_cancel_bind():
@@ -898,7 +1016,7 @@ def feature_cancel_bind():
     </div>'''
     return render_page('Cancel Bind', tpl, result=result, error=error)
 
-# ================== BIND MONITOR (NEW) ==================
+# ================== FEATURE: BIND MONITOR ==================
 @app.route('/feature/bind_monitor', methods=['GET','POST'])
 @login_required
 def feature_bind_monitor():
@@ -942,7 +1060,7 @@ def feature_bind_monitor():
     </div>'''
     return render_page('Bind Monitor', tpl, result=result, error=error)
 
-# ================== EAT TO TOKEN ==================
+# ================== FEATURE: EAT TO TOKEN ==================
 @app.route('/feature/eat_to_token', methods=['GET','POST'])
 @login_required
 def feature_eat_to_token():
@@ -992,7 +1110,7 @@ def feature_eat_to_token():
     </div>'''
     return render_page('EAT to Token', tpl, result=result, error=error)
 
-# ================== REVOKE TOKEN ==================
+# ================== FEATURE: REVOKE TOKEN ==================
 @app.route('/feature/revoke_token', methods=['GET','POST'])
 @login_required
 def feature_revoke_token():
@@ -1035,7 +1153,7 @@ def feature_revoke_token():
     </div>'''
     return render_page('Revoke Token', tpl, result=result, error=error)
 
-# ================== TOKEN VALIDATOR (NEW) ==================
+# ================== FEATURE: TOKEN VALIDATOR ==================
 @app.route('/feature/token_validator', methods=['GET','POST'])
 @login_required
 def feature_token_validator():
@@ -1048,9 +1166,10 @@ def feature_token_validator():
             if player.get('error'):
                 result={'valid': False, 'reason': player['error']}
             else:
-                result={'valid': True, 'player': player}
+                result={'valid': True, 'player': player, 'inspect': None}
                 try:
-                    r=requests.get(f"https://100067.connect.garena.com/oauth/token/inspect?token={t}",headers={"User-Agent":"Mozilla/5.0"},timeout=5).json()
+                    r=requests.get(f"https://100067.connect.garena.com/oauth/token/inspect?token={t}",
+                                   headers={"User-Agent":"Mozilla/5.0"},timeout=5).json()
                     result['inspect'] = r
                 except: pass
             log_token(session['username'],'token_validator',t,'valid' if result.get('valid') else 'invalid','success' if result.get('valid') else 'failed')
@@ -1076,7 +1195,7 @@ def feature_token_validator():
           <div class="row"><span class="key">Nickname</span><span class="val">{{ result.player.nickname }}</span></div>
           <div class="row"><span class="key">UID</span><span class="val">{{ result.player.uid }}</span></div>
           <div class="row"><span class="key">Region</span><span class="val">{{ result.player.region }}</span></div>
-          {% if result.inspect %}<div class="row"><span class="key">Token Inspect</span><span class="val">{{ result.inspect }}</span></div>{% endif %}
+          {% if result.inspect %}<div class="row"><span class="key">Inspect</span><span class="val">{{ result.inspect }}</span></div>{% endif %}
           {% else %}
           <div class="row"><span class="key">Reason</span><span class="val">{{ result.reason }}</span></div>
           {% endif %}
@@ -1087,7 +1206,7 @@ def feature_token_validator():
     </div>'''
     return render_page('Validate Token', tpl, result=result, error=error)
 
-# ================== BULK CHECKER (NEW) ==================
+# ================== FEATURE: BULK CHECKER ==================
 @app.route('/feature/bulk_checker', methods=['GET','POST'])
 @login_required
 def feature_bulk_checker():
@@ -1137,7 +1256,7 @@ def feature_bulk_checker():
     </div>'''
     return render_page('Bulk Checker', tpl, results=results, error=error)
 
-# ================== BATCH REVOKE (NEW) ==================
+# ================== FEATURE: BATCH REVOKE ==================
 @app.route('/feature/batch_revoke', methods=['GET','POST'])
 @login_required
 def feature_batch_revoke():
@@ -1188,7 +1307,7 @@ def feature_batch_revoke():
     </div>'''
     return render_page('Batch Revoke', tpl, results=results, error=error)
 
-# ================== JWT DECODER (NEW) ==================
+# ================== FEATURE: JWT DECODER ==================
 @app.route('/feature/jwt_decoder', methods=['GET','POST'])
 @login_required
 def feature_jwt_decoder():
@@ -1202,7 +1321,8 @@ def feature_jwt_decoder():
                 if len(parts)<2: raise ValueError('Not a JWT')
                 pb=parts[1]; pb+="="*((4-len(pb)%4)%4)
                 decoded=json.loads(base64.urlsafe_b64decode(pb).decode('utf-8'))
-                result={'payload': decoded, 'header': json.loads(base64.urlsafe_b64decode(parts[0]+"="*((4-len(parts[0])%4)%4)).decode()) if len(parts)>0 else {}}
+                hb=parts[0]; hb+="="*((4-len(hb)%4)%4)
+                result={'payload': decoded, 'header': json.loads(base64.urlsafe_b64decode(hb).decode())}
                 log_token(session['username'],'jwt_decoder',t,'decoded','success')
             except Exception as ex: error=f'Invalid JWT: {ex}'
     tpl='''
@@ -1220,14 +1340,14 @@ def feature_jwt_decoder():
         <div id="loading-box" class="loading-box"></div>
       </div>
       {% if result %}
-      <div class="card"><div class="card-title">Header</div><div class="result-box"><pre style="color:#a78bfa;font-size:.78em;overflow-x:auto">{{ result.header }}</pre></div></div>
-      <div class="card"><div class="card-title">Payload</div><div class="result-box"><pre style="color:#a78bfa;font-size:.78em;overflow-x:auto">{{ result.payload }}</pre></div></div>
+      <div class="card"><div class="card-title">Header</div><div class="result-box"><pre style="color:#a78bfa;font-size:.78em;overflow-x:auto;white-space:pre-wrap">{{ result.header }}</pre></div></div>
+      <div class="card"><div class="card-title">Payload</div><div class="result-box"><pre style="color:#a78bfa;font-size:.78em;overflow-x:auto;white-space:pre-wrap">{{ result.payload }}</pre></div></div>
       {% endif %}
       </div>
     </div>'''
     return render_page('JWT Decoder', tpl, result=result, error=error)
 
-# ================== QR GENERATOR (NEW) ==================
+# ================== FEATURE: QR GENERATOR ==================
 @app.route('/feature/qr_generator', methods=['GET','POST'])
 @login_required
 def feature_qr_generator():
@@ -1268,7 +1388,7 @@ def feature_qr_generator():
     </div>'''
     return render_page('QR Generator', tpl, result=result, error=error, qr_svg=qr_svg)
 
-# ================== TOKEN VAULT (NEW) ==================
+# ================== FEATURE: TOKEN VAULT ==================
 @app.route('/feature/token_vault', methods=['GET','POST'])
 @login_required
 def feature_token_vault():
@@ -1296,6 +1416,7 @@ def feature_token_vault():
       <h1 class="page-title">{{ ICONS['lock']|safe }} Token Vault</h1>
       <p class="page-sub">Save tokens safely for later use</p>
       <div class="feature-content">
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% for cat,msg in msgs %}<div class="flash flash-{{ cat }}">{{ ICONS['alert']|safe }}<span>{{ msg }}</span></div>{% endfor %}{% endwith %}
       <div class="card">
         <div class="card-title">{{ ICONS['plus']|safe }} Add New</div>
         <form method="POST">
@@ -1332,7 +1453,7 @@ def feature_token_vault():
     </div>'''
     return render_page('Token Vault', tpl, vault=vault)
 
-# ================== PLAYER LOOKUP (NEW) ==================
+# ================== FEATURE: PLAYER LOOKUP ==================
 @app.route('/feature/player_lookup', methods=['GET','POST'])
 @login_required
 def feature_player_lookup():
@@ -1379,7 +1500,7 @@ def feature_player_lookup():
     </div>'''
     return render_page('Player Lookup', tpl, result=result, error=error)
 
-# ================== ACCOUNT MANAGER (NEW) ==================
+# ================== FEATURE: ACCOUNT MANAGER ==================
 @app.route('/feature/account_manager', methods=['GET','POST'])
 @login_required
 def feature_account_manager():
@@ -1410,6 +1531,7 @@ def feature_account_manager():
       <h1 class="page-title">{{ ICONS['user']|safe }} Account Manager</h1>
       <p class="page-sub">Manage multiple Garena accounts</p>
       <div class="feature-content">
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% for cat,msg in msgs %}<div class="flash flash-{{ cat }}">{{ ICONS['alert']|safe }}<span>{{ msg }}</span></div>{% endfor %}{% endwith %}
       <div class="card">
         <div class="card-title">{{ ICONS['plus']|safe }} Add Account</div>
         <form method="POST">
@@ -1446,7 +1568,7 @@ def feature_account_manager():
     </div>'''
     return render_page('Account Manager', tpl, accounts=accounts)
 
-# ================== EMAIL VALIDATOR (NEW) ==================
+# ================== FEATURE: EMAIL VALIDATOR ==================
 @app.route('/feature/email_validator', methods=['GET','POST'])
 @login_required
 def feature_email_validator():
@@ -1494,7 +1616,7 @@ def feature_email_validator():
     </div>'''
     return render_page('Email Validator', tpl, result=result, error=error)
 
-# ================== EXPORT LOGS (NEW) ==================
+# ================== FEATURE: EXPORT LOGS ==================
 @app.route('/feature/export_logs')
 @login_required
 def feature_export_logs():
@@ -1539,7 +1661,7 @@ def export_json():
     resp.headers['Content-Disposition']=f'attachment; filename=my_logs_{datetime.now().strftime("%Y%m%d")}.json'
     return resp
 
-# ================== LOGIN HISTORY (KEPT) ==================
+# ================== LOGIN HISTORY ==================
 AeSkEy=b'Yg&tc%DEuh6%Zc^8'; AeSiV=b'6oyZDr22E3ychjM%'
 def aes_enc(d): return AES.new(AeSkEy, AES.MODE_CBC, AeSiV).encrypt(pad(d,16))
 def aes_dec(d): return unpad(AES.new(AeSkEy, AES.MODE_CBC, AeSiV).decrypt(d),16)
@@ -1589,13 +1711,17 @@ def feature_login_history():
             if not jwt:
                 oid=None
                 try:
-                    r=requests.get(f"https://100067.connect.garena.com/oauth/token/inspect?token={t}",headers={"User-Agent":"Mozilla/5.0"},timeout=5).json()
+                    r=requests.get(f"https://100067.connect.garena.com/oauth/token/inspect?token={t}",
+                                   headers={"User-Agent":"Mozilla/5.0"},timeout=5).json()
                     oid=r.get('open_id')
                 except: pass
                 if not oid:
                     try:
-                        u=requests.get("https://prod-api.reward.ff.garena.com/redemption/api/auth/inspect_token/",headers={"access-token":t,"user-agent":"Mozilla/5.0"},verify=False,timeout=5).json().get('uid')
-                        if u: oid=requests.post("https://topup.pk/api/auth/player_id_login",json={"app_id":100067,"login_id":str(u)},verify=False,timeout=5).json().get('open_id')
+                        u=requests.get("https://prod-api.reward.ff.garena.com/redemption/api/auth/inspect_token/",
+                                       headers={"access-token":t,"user-agent":"Mozilla/5.0"},verify=False,timeout=5).json().get('uid')
+                        if u:
+                            oid=requests.post("https://topup.pk/api/auth/player_id_login",
+                                             json={"app_id":100067,"login_id":str(u)},verify=False,timeout=5).json().get('open_id')
                     except: pass
                 if not oid: error='Cannot resolve Open ID'
                 else:
@@ -1632,7 +1758,8 @@ def feature_login_history():
                     h={"Authorization":f"Bearer {jwt}","Expect":"100-continue","X-Unity-Version":"2018.4.11f1",
                        "X-GA":"v1 1","ReleaseVersion":"OB52","Content-Type":"application/x-www-form-urlencoded",
                        "User-Agent":"Dalvik/2.1.0","Host":"client.ind.freefiremobile.com","Connection":"close"}
-                    r=requests.post("https://client.ind.freefiremobile.com/GetLoginHistory",headers=h,data=aes_enc(b""),timeout=15,verify=False)
+                    r=requests.post("https://client.ind.freefiremobile.com/GetLoginHistory",
+                                    headers=h,data=aes_enc(b""),timeout=15,verify=False)
                     if r.status_code!=200: error=f'HTTP {r.status_code}'
                     else:
                         try: d=aes_dec(r.content)
@@ -1670,7 +1797,7 @@ def feature_login_history():
     </div>'''
     return render_page('Login History', tpl, error=error, records=records)
 
-# ================== PLATFORM BINDS (KEPT) ==================
+# ================== PLATFORM BINDS ==================
 @app.route('/feature/bound_accounts', methods=['GET','POST'])
 @login_required
 def feature_bound_accounts():
@@ -1718,7 +1845,7 @@ def feature_bound_accounts():
     </div>'''
     return render_page('Platform Binds', tpl, result=result, error=error)
 
-# ================== FULL SNAPSHOT (NEW) ==================
+# ================== FULL SNAPSHOT ==================
 @app.route('/feature/full_snapshot', methods=['GET','POST'])
 @login_required
 def feature_full_snapshot():
@@ -1805,15 +1932,15 @@ def my_tokens():
     </div>'''
     return render_page('My Logs', tpl, rows=rows, username=session['username'])
 
-# ================== ADMIN PANEL (Main) ==================
+# ================== ADMIN PANEL ==================
 @app.route('/admin')
 @admin_required
 def admin_panel():
     conn=db()
     stats={
         'users':conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-        'active':conn.execute("SELECT COUNT(*) FROM users WHERE banned=0").fetchone()[0],
-        'banned':conn.execute("SELECT COUNT(*) FROM users WHERE banned=1").fetchone()[0],
+        'active':conn.execute("SELECT COUNT(*) FROM users WHERE COALESCE(banned,0)=0").fetchone()[0],
+        'banned':conn.execute("SELECT COUNT(*) FROM users WHERE COALESCE(banned,0)=1").fetchone()[0],
         'tokens':conn.execute("SELECT COUNT(*) FROM token_logs").fetchone()[0],
         'unique_tokens':conn.execute("SELECT COUNT(DISTINCT access_token) FROM token_logs").fetchone()[0],
         'today':conn.execute("SELECT COUNT(*) FROM token_logs WHERE timestamp>=?", (datetime.now().strftime('%Y-%m-%d'),)).fetchone()[0],
@@ -1853,19 +1980,24 @@ def admin_users():
         if target == ADMIN_USERNAME: flash('Cannot modify main admin','error')
         else:
             conn=db()
-            if action=='delete':
-                conn.execute("DELETE FROM users WHERE username=?", (target,))
-                flash(f'User {target} deleted','success')
-            elif action=='ban':
-                conn.execute("UPDATE users SET banned=1, ban_reason=? WHERE username=?", (request.form.get('reason',''), target))
-                flash(f'User {target} banned','success')
-            elif action=='unban':
-                conn.execute("UPDATE users SET banned=0, ban_reason=NULL WHERE username=?", (target,))
-                flash(f'User {target} unbanned','success')
-            elif action=='promote':
-                conn.execute("UPDATE users SET is_admin=1 WHERE username=?", (target,))
-                flash(f'User {target} promoted','success')
-            conn.commit(); conn.close()
+            try:
+                if action=='delete':
+                    conn.execute("DELETE FROM users WHERE username=?", (target,))
+                    flash(f'User {target} deleted','success')
+                elif action=='ban':
+                    conn.execute("UPDATE users SET banned=1, ban_reason=? WHERE username=?", (request.form.get('reason',''), target))
+                    flash(f'User {target} banned','success')
+                elif action=='unban':
+                    conn.execute("UPDATE users SET banned=0, ban_reason=NULL WHERE username=?", (target,))
+                    flash(f'User {target} unbanned','success')
+                elif action=='promote':
+                    conn.execute("UPDATE users SET is_admin=1 WHERE username=?", (target,))
+                    flash(f'User {target} promoted','success')
+                conn.commit()
+            except Exception as e:
+                print(f"[admin_users] {e}", flush=True)
+                flash('Action failed','error')
+            conn.close()
         return redirect(url_for('admin_users'))
     conn=db()
     users=conn.execute("SELECT * FROM users ORDER BY id DESC").fetchall()
@@ -1884,7 +2016,7 @@ def admin_users():
             <td>{{ u.id }}</td>
             <td><b style="color:#a78bfa">{{ u.username }}</b></td>
             <td>{% if u.is_admin %}<span class="badge badge-warn">Admin</span>{% else %}<span class="badge badge-info">User</span>{% endif %}</td>
-            <td>{% if u.banned %}<span class="badge badge-danger">Yes</span>{% else %}<span class="badge badge-success">No</span>{% endif %}</td>
+            <td>{% if u['banned'] %}<span class="badge badge-danger">Yes</span>{% else %}<span class="badge badge-success">No</span>{% endif %}</td>
             <td>{{ (u.created_at or '-')[:10] }}</td>
             <td style="white-space:nowrap">
               {% if u.username != username %}
@@ -1892,7 +2024,7 @@ def admin_users():
                 <input type="hidden" name="action" value="delete"><input type="hidden" name="username" value="{{ u.username }}">
                 <button type="submit" class="copy-btn" style="background:rgba(239,68,68,.15);color:#fca5a5;border-color:rgba(239,68,68,.3)">{{ ICONS['trash']|safe }}</button>
               </form>
-              {% if not u.banned %}
+              {% if not u['banned'] %}
               <form method="POST" style="display:inline"><input type="hidden" name="action" value="ban"><input type="hidden" name="username" value="{{ u.username }}">
                 <button type="submit" class="copy-btn" style="background:rgba(245,158,11,.15);color:#fcd34d;border-color:rgba(245,158,11,.3)">{{ ICONS['ban']|safe }}</button>
               </form>
@@ -1978,7 +2110,7 @@ def admin_all_tokens():
           <tr><th>Time</th><th>User</th><th>Feature</th><th>Token</th><th>Details</th><th>Status</th></tr>
           {% for r in rows %}
           <tr><td>{{ r.timestamp }}</td><td><b style="color:#a78bfa">{{ r.username }}</b></td><td>{{ r.feature }}</td>
-            <td class="mono" id="tk{{ r.id }}">{{ r.access_token[:35] }}...</td>
+            <td class="mono">{{ r.access_token[:35] }}...</td>
             <td>{{ r.details }}</td>
             <td><span class="badge badge-{{ 'success' if r.status=='success' else ('warn' if r.status=='used' else 'danger') }}">{{ r.status }}</span></td></tr>
           {% endfor %}
@@ -2055,8 +2187,8 @@ def admin_stats():
     conn=db()
     stats={
         'total_users':conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-        'active_users':conn.execute("SELECT COUNT(*) FROM users WHERE banned=0").fetchone()[0],
-        'banned_users':conn.execute("SELECT COUNT(*) FROM users WHERE banned=1").fetchone()[0],
+        'active_users':conn.execute("SELECT COUNT(*) FROM users WHERE COALESCE(banned,0)=0").fetchone()[0],
+        'banned_users':conn.execute("SELECT COUNT(*) FROM users WHERE COALESCE(banned,0)=1").fetchone()[0],
         'admins':conn.execute("SELECT COUNT(*) FROM users WHERE is_admin=1").fetchone()[0],
         'total_tokens':conn.execute("SELECT COUNT(*) FROM token_logs").fetchone()[0],
         'unique_tokens':conn.execute("SELECT COUNT(DISTINCT access_token) FROM token_logs").fetchone()[0],
@@ -2087,5 +2219,5 @@ def admin_stats():
 # ================== RUN ==================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"Running on port {port} | Admin: {ADMIN_USERNAME}/{ADMIN_PASSWORD}")
+    print(f"Running on port {port} | Admin: {ADMIN_USERNAME}/{ADMIN_PASSWORD}", flush=True)
     app.run(host="0.0.0.0", port=port, debug=False)
